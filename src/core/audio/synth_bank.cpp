@@ -7,6 +7,7 @@
 #include "audio/cpu_meter.h"
 #include "fastrun.h"
 #include "formats/patch_pb.h"
+#include "model/fx.h"
 
 namespace ot {
 namespace audio {
@@ -37,6 +38,8 @@ void SynthBank::reset() {
     }
     for (int s = 0; s < kSynthSlots; ++s) {
         Slot& sl = slots_[s];
+        if (sl.preset) rebind_[s] = true;
+        sl.preset = 0;
         for (auto& o : sl.ovr) o = -1;
         sl.macroDirty = true;
         sl.ntouched = 0;
@@ -54,11 +57,26 @@ void SynthBank::reset() {
 void SynthBank::bindPatch(int s, const SynthPatch* p) {
     if (s < 0 || s >= kSynthSlots) return;
     slots_[s].patch = p;
+    slots_[s].preset = 0;
     rebind_[s] = true;
 }
 
 void SynthBank::patchChanged(int s) {
-    if (s >= 0 && s < kSynthSlots) rebind_[s] = true;
+    if (s < 0 || s >= kSynthSlots) return;
+    slots_[s].preset = 0;   // an edit is heard, on the patch being edited
+    rebind_[s] = true;
+}
+bool SynthBank::presetSelect(int s, uint8_t n) {
+    if (s < 0 || s >= kSynthSlots || !presetTakes(n)) return false;   // empty: the slot plays on
+    if (slots_[s].preset == n) return true;   // a repeated Z costs nothing
+    slots_[s].preset = n;
+    rebind_[s] = true;
+    return true;
+}
+void SynthBank::presetChanged(uint8_t n) {
+    if (!n) return;
+    for (int s = 0; s < kSynthSlots; ++s)
+        if (slots_[s].preset == n) rebind_[s] = true;   // [OT] the slot stays on it (unlike patchChanged)
 }
 
 void SynthBank::setSlotRecord(int s, const SynthSlotRecord& r) {
@@ -89,7 +107,7 @@ SynthSlotView SynthBank::slotView(int s) const {
     v.available = okModel && synthEngineFor(v.engine) != nullptr;
     v.patchBound = sl.patch != nullptr;
     v.patchMismatch = !sl.patch || sl.patch->engine != v.engine;
-    v.polyphony = int(r.polyphony > 8 ? 8 : r.polyphony);
+    v.polyphony = polyOf(sl, r);   // [OT] a preset's own polyphony while bound
     const int c = cap();
     v.playable = v.polyphony < c ? v.polyphony : c;
     v.limited = c < v.polyphony;
@@ -154,7 +172,7 @@ int SynthBank::cap() const {
 int SynthBank::playable(int s) const {
     const Slot& sl = slots_[s];
     if (!sl.eng) return 0;
-    const int poly = int(sl.rec.polyphony > 8 ? 8 : sl.rec.polyphony);
+    const int poly = polyOf(sl, sl.rec);
     const int c = cap();
     return poly < c ? poly : c;
 }
@@ -214,21 +232,13 @@ void SynthBank::sync() {
             if (sl.rec.model != oldModel) rebind_[s] = true;
             for (int k = 0; k < kSynthSeqMacros; ++k) sl.page[k] = sl.rec.macros[k] > 127 ? 127 : sl.rec.macros[k];
             sl.macroDirty = true;
-            sl.gainLin = std::isfinite(sl.rec.gainDb) ? dbToGain(clampf(sl.rec.gainDb, -96.0f, 12.0f)) : 0.0f;
-            if (sl.rec.gainDb <= -96.0f) sl.gainLin = 0.0f;
-            // Balance (linear, spec 04 §4.3) and SEND law, cached per record;
-            // the send gains include the (L + R) / 2 of the mono effect input.
-            const float pan = std::isfinite(sl.rec.pan) ? clampf(sl.rec.pan, -100.0f, 100.0f) : 0.0f;
-            sl.mixL = sl.gainLin * (pan > 0.0f ? 1.0f - pan * 0.01f : 1.0f);
-            sl.mixR = sl.gainLin * (pan < 0.0f ? 1.0f + pan * 0.01f : 1.0f);
-            auto send = [](float v) { return std::isfinite(v) ? sendGain(int(clampf(v, 0.0f, 100.0f) + 0.5f)) : 0.0f; };
-            sl.mixD = 0.5f * send(sl.rec.delaySend);
-            sl.mixE = 0.5f * send(sl.rec.reverbSend);
+            applyMix(sl);
             }
         }
         if (rebind_[s]) {
             rebind_[s] = false;
             bindEngine(s);
+            applyMix(sl);   // [OT] a preset's mix comes and goes with its patch
         }
     }
     if (aud_.req) {
@@ -248,11 +258,13 @@ void SynthBank::sync() {
 
 void SynthBank::bindEngine(int s) {
     Slot& sl = slots_[s];
+    const SynthPatch* patch = patchOf(sl);
+    sl.bound = patch;
     const bool okModel = sl.rec.model < uint32_t(kSynthModelCount);
-    const int32_t id = okModel ? synthEngineId(SynthModel(sl.rec.model)) : 0;
+    const int32_t id = patch != sl.patch ? patch->engine : (okModel ? synthEngineId(SynthModel(sl.rec.model)) : 0);   // a preset brings its engine
     ISynthEngine* e = synthEngineFor(id);
     if (e && override_) e = override_;
-    sl.mismatch = !sl.patch || sl.patch->engine != id;
+    sl.mismatch = !patch || patch->engine != id;
     if (sl.mismatch) e = nullptr;
     const bool restart = e != sl.eng || id != sl.engineId;
     if (restart) {
@@ -269,7 +281,30 @@ void SynthBank::bindEngine(int s) {
     reloadParams(s, restart);
 }
 
-float SynthBank::paramBase(const Slot& sl, int i) const { return synthParamGet(*sl.patch, i); }
+// The mixer gains of the mix the slot plays (mixOf), cached until it changes.
+// Balance (linear, spec 04 §4.3) and SEND law; the send gains include the
+// (L + R) / 2 of the mono effect input.
+void SynthBank::applyMix(Slot& sl) {
+    const SynthPatch* m = mixOf(sl);
+    const float gainDb = m ? patchMix(*m, kPatchMixGain) : sl.rec.gainDb;
+    sl.gainLin = std::isfinite(gainDb) ? dbToGain(clampf(gainDb, -96.0f, 12.0f)) : 0.0f;
+    if (gainDb <= -96.0f) sl.gainLin = 0.0f;
+    const float panIn = m ? patchMix(*m, kPatchMixPan) : sl.rec.pan;
+    const float pan = std::isfinite(panIn) ? clampf(panIn, -100.0f, 100.0f) : 0.0f;
+    sl.mixL = sl.gainLin * (pan > 0.0f ? 1.0f - pan * 0.01f : 1.0f);
+    sl.mixR = sl.gainLin * (pan < 0.0f ? 1.0f + pan * 0.01f : 1.0f);
+    // [OT] The sends as 0..100 too: the base a track's Performance send adds
+    // to (render reads these, never the preset).
+    auto pct = [](float v) { return std::isfinite(v) ? int(clampf(v, 0.0f, 100.0f) + 0.5f) : 0; };
+    const int d = pct(m ? patchMix(*m, kPatchMixDelay) : sl.rec.delaySend);
+    const int e = pct(m ? patchMix(*m, kPatchMixReverb) : sl.rec.reverbSend);
+    sl.baseD = uint8_t(d);
+    sl.baseE = uint8_t(e);
+    sl.mixD = 0.5f * sendGain(d);
+    sl.mixE = 0.5f * sendGain(e);
+}
+
+float SynthBank::paramBase(const Slot& sl, int i) const { return synthParamGet(*sl.bound, i); }
 
 void SynthBank::reloadParams(int s, bool jump) {
     Slot& sl = slots_[s];
@@ -279,7 +314,7 @@ void SynthBank::reloadParams(int s, bool jump) {
     sl.ntgt = sl.ntgt7 = 0;
     sl.volK = 0.0f;
     sl.volIdx = -1;
-    if (!sl.patch || sl.mismatch) {
+    if (!sl.bound || sl.mismatch) {
         p.count = 0;
         p.moving = false;
         ++p.serial;
@@ -312,7 +347,7 @@ void SynthBank::reloadParams(int s, bool jump) {
     }
     // Compile the macro targets (empty targets -1 inside count are skipped).
     for (int k = 0; k < kSynthSeqMacros; ++k) {
-        const PatchMacro& m = sl.patch->macros[k];
+        const PatchMacro& m = sl.bound->macros[k];
         for (int j = 0, c = synthMacroTargets(m); j < c; ++j) {
             const int i = m.targets[j].param;
             const float a = patchBitsToFloat(m.targets[j].amountBits);
@@ -320,7 +355,7 @@ void SynthBank::reloadParams(int s, bool jump) {
             sl.tgt[sl.ntgt++] = Slot::Tgt{uint8_t(i), uint8_t(k), a * (t[i].max - t[i].min)};
         }
     }
-    const PatchMacro& m7 = sl.patch->macros[kPatchMacroVelocity];
+    const PatchMacro& m7 = sl.bound->macros[kPatchMacroVelocity];
     for (int j = 0, c = synthMacroTargets(m7); j < c; ++j) {
         const int i = m7.targets[j].param;
         const float a = patchBitsToFloat(m7.targets[j].amountBits);
@@ -336,13 +371,13 @@ void SynthBank::reloadParams(int s, bool jump) {
 // targeted parameters; untargeted ones keep the patch value.
 void SynthBank::applyMacros(int s) {
     Slot& sl = slots_[s];
-    if (!sl.patch || sl.mismatch || (!sl.macroDirty)) return;
+    if (!sl.bound || sl.mismatch || (!sl.macroDirty)) return;
     sl.macroDirty = false;
     uint8_t val[kSynthSeqMacros];
     float m[kSynthSeqMacros];
     for (int k = 0; k < kSynthSeqMacros; ++k) {
         val[k] = sl.ovr[k] >= 0 ? uint8_t(sl.ovr[k]) : sl.page[k];
-        m[k] = synthMacroM(val[k], sl.patch->macros[k].bipolar);
+        m[k] = synthMacroM(val[k], sl.bound->macros[k].bipolar);
         sl.applied[k] = val[k];
     }
     if (sl.ntgt == 0 && sl.ntgt7 == 0) return;
@@ -801,10 +836,15 @@ void SynthBank::macroFx(int slot, int macro, uint8_t value) {
 }
 
 void SynthBank::transportStop() {
-    for (auto& sl : slots_) {
+    for (int s = 0; s < kSynthSlots; ++s) {
+        Slot& sl = slots_[s];
         for (auto& o : sl.ovr) {
             if (o >= 0) sl.macroDirty = true;
             o = -1;
+        }
+        if (sl.preset) {   // Z lasts until Stop
+            sl.preset = 0;
+            rebind_[s] = true;
         }
     }
 }
@@ -965,8 +1005,8 @@ OT_FASTRUN_FN bool SynthBank::render(const SynthMixInputs& in, float* mL, float*
             if (perfActive_ && seqTrack) {
                 const SynthPerf& pf = perf_[ot];
                 if (pf.pan) pan = clampi((pan >= 0 ? pan : 50) + pf.pan, 0, 100);
-                if (pf.dsend) sendD = clampi((sendD >= 0 ? sendD : int(clampf(sl.rec.delaySend, 0.0f, 100.0f) + 0.5f)) + pf.dsend, 0, 100);
-                if (pf.rsend) sendR = clampi((sendR >= 0 ? sendR : int(clampf(sl.rec.reverbSend, 0.0f, 100.0f) + 0.5f)) + pf.rsend, 0, 100);
+                if (pf.dsend) sendD = clampi((sendD >= 0 ? sendD : int(sl.baseD)) + pf.dsend, 0, 100);
+                if (pf.rsend) sendR = clampi((sendR >= 0 ? sendR : int(sl.baseE)) + pf.rsend, 0, 100);
             }
             const bool own = tapV || sendD >= 0 || sendR >= 0 || pan >= 0;
             float* vl = busL_;

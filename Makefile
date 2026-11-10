@@ -17,7 +17,7 @@
 #                    sim/third_party/rom_fonts.inc); needs python3 + Pillow
 # make export-sinc-table -> regenerate the committed weight table of the 44.1 kHz export
 #                    (src/core/audio/export_sinc_table.inc); needs python3
-VERSION   ?= 2.2.5
+VERSION   ?= 2.2.7
 BUILD     := build
 # Image file names must be exactly 24 characters (like the stock
 # "PolyendTracker_1.9.2.ptf"): the device's update bootloader rejected a
@@ -102,6 +102,11 @@ CORE_C    := $(wildcard $(CORE)/*.c)
 CORE_CXX  := $(filter-out $(CORE)/main.cpp,$(wildcard $(CORE)/*.cpp))
 APP_C     := $(shell find src -name '*.c') third_party/fatfs/ff.c third_party/fatfs/ffunicode.c
 APP_CXX   := $(shell find src -name '*.cpp')
+# The display command recorder (src/core/remote) is for the simulator and
+# the host tests only. Built into the image, its copy of the inline IDisplay
+# helpers (speculatively devirtualised towards the recorder) can be the one
+# the linker keeps.
+APP_CXX   := $(filter-out src/core/remote/%,$(APP_CXX))
 ifeq ($(OT_GAMES),0)
 APP_CXX   := $(filter-out src/core/games/%,$(APP_CXX))
 endif
